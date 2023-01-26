@@ -7,3 +7,6 @@ find_package(unordered_dense CONFIG REQUIRED)
 
 add_executable(locktest lock.cc)
 target_link_libraries(locktest pthread unordered_dense::unordered_dense)
+
+add_executable(ringtest ring.cc)
+target_link_libraries(ringtest pthread unordered_dense::unordered_dense)
