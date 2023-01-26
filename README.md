@@ -30,7 +30,7 @@
 
 ## ring
 
-### 1 线程
+### MPSC 1 线程
 
 ```
 [PUT] total 1.7455 Mops, in 14.3226 s
@@ -39,11 +39,29 @@
       per-thread 2.1856 Mops
 ```
 
-### 16 线程
+### MPSC 16 线程
 
 ```
 [PUT] total 9.8068 Mops, in 40.7880 s
       per-thread 0.6129 Mops
 [GET] total 10.1437 Mops, in 39.4334 s
       per-thread 0.6340 Mops
+```
+
+### SPSC 1 线程
+
+```
+[PUT] total 2.1419 Mops, in 11.6718 s
+      per-thread 2.1419 Mops
+[GET] total 2.4736 Mops, in 10.1066 s
+      per-thread 2.4736 Mops
+```
+
+### SPSC 16 线程
+
+```
+[PUT] total 12.2792 Mops, in 32.5755 s
+      per-thread 0.7674 Mops
+[GET] total 9.3389 Mops, in 42.8318 s
+      per-thread 0.5837 Mops
 ```
