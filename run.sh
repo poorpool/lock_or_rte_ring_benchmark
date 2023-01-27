@@ -2,5 +2,6 @@
 
 # ./build/locktest $1 $2
 # ./build/ringmpsctest $1 $2
-# ./build/ringspsctest $1 $2
-./build/ringccqtest $1 $2
+./build/ringspsctest $1 $2
+# ./build/ringccqtest $1 $2
+# ./build/ringrwqtest $1 $2

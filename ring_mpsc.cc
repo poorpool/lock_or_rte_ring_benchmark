@@ -20,6 +20,7 @@ using ReadLock = std::shared_lock<std::shared_mutex>;
 using WriteLock = std::unique_lock<std::shared_mutex>;
 
 constexpr int kOpsPerThread = 25000000; // 每个线程执行多少次读/写操作
+constexpr int kPullNumber = 32;         // 连续 pull 几下
 
 pthread_barrier_t barrier1, barrier2, barrier3;
 
@@ -98,7 +99,7 @@ void threadFunc(int idx) {
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
   while (should_thread_run) {
-    if (request_cnt < kOpsPerThread) {
+    for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
       uint64_t key_hash =
           wyhash(req[request_cnt].key.c_str(), req[request_cnt].key.length(), 0,
                  _wyp); // 使用快速的 wyhash（还行的优化）
@@ -114,12 +115,15 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    void *ring_req_ptr;
-    ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-    if (ret == 0) {
-      auto *r = static_cast<Request *>(ring_req_ptr);
-      hash_map[r->key] = r->value;
-      g_ctx.finished_cnt[idx].val++;
+
+    for (int i = 0; i < kPullNumber; i++) {
+      void *ring_req_ptr;
+      ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
+      if (ret == 0) {
+        auto *r = static_cast<Request *>(ring_req_ptr);
+        hash_map[r->key] = r->value;
+        g_ctx.finished_cnt[idx].val++;
+      }
     }
   }
   pthread_barrier_wait(&barrier3);
@@ -131,7 +135,7 @@ void threadFunc(int idx) {
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
   while (should_thread_run) {
-    if (request_cnt < kOpsPerThread) {
+    for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
       uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
                                  req[request_cnt].key.length(), 0, _wyp);
       int to_thread = key_hash % g_ctx.thread_num;
@@ -149,15 +153,17 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    void *ring_req_ptr;
-    ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-    if (ret == 0) {
-      auto *r = static_cast<Request *>(ring_req_ptr);
-      int value = hash_map[r->key];
-      if (value == 0) {
-        invalid_cnt++;
+    for (int i = 0; i < kPullNumber; i++) {
+      void *ring_req_ptr;
+      ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
+      if (ret == 0) {
+        auto *r = static_cast<Request *>(ring_req_ptr);
+        int value = hash_map[r->key];
+        if (value == 0) {
+          invalid_cnt++;
+        }
+        g_ctx.finished_cnt[idx].val++;
       }
-      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);

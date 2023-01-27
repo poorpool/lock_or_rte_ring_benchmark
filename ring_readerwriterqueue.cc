@@ -1,4 +1,4 @@
-#include "3rdparty/concurrentqueue.h"
+#include "3rdparty/readerwriterqueue.h"
 #include "3rdparty/wyhash.h"
 #include <ankerl/unordered_dense.h>
 #include <cstdint>
@@ -16,6 +16,8 @@
 using std::string;
 using std::thread;
 using std::vector;
+using ReadLock = std::shared_lock<std::shared_mutex>;
+using WriteLock = std::unique_lock<std::shared_mutex>;
 
 constexpr int kOpsPerThread = 25000000; // 每个线程执行多少次读/写操作
 constexpr int kPullNumber = 32;         // 连续 pull 几下
@@ -25,23 +27,23 @@ pthread_barrier_t barrier1, barrier2, barrier3;
 enum OP_TYPE { kOpTypeRead = 1, kOpTypeWrite = 2 };
 
 struct Request {
-  OP_TYPE type; // 实际没用上
+  OP_TYPE type;
   string key;
   int64_t value;
 };
-using MoodyQueue = moodycamel::ConcurrentQueue<Request *>;
 
 struct __attribute__((aligned(64))) PaddingInt { // cacheline 对齐
   int val;
 };
 
+using MoodyQueue = moodycamel::ReaderWriterQueue<Request *>;
 struct GlobalContext {
   int thread_num;
   int start_core;
 
   vector<thread> threads;
-  vector<PaddingInt> finished_cnt; // thread_num 个
-  vector<MoodyQueue> rings;        // thread_num 个
+  vector<PaddingInt> finished_cnt;  // thread_num 个
+  vector<vector<MoodyQueue>> rings; // thread_num^2 个
 };
 GlobalContext g_ctx;
 
@@ -83,13 +85,11 @@ void threadFunc(int idx) {
   }
 
   std::hash<string> hasher;
+  ankerl::unordered_dense::map<string, int64_t> hash_map;
+  hash_map.reserve(kOpsPerThread * 2);
   vector<Request> req;
   req.reserve(kOpsPerThread);
   GenerateWriteRequests(req);
-  ankerl::unordered_dense::map<string, uint64_t>
-      hash_map; // 使用线程本地的变量而不是 g_ctx
-                // 中的一个哈希表数组，减少访存次数
-  hash_map.reserve(kOpsPerThread * 2);
 
   // test put
   int request_cnt = 0;
@@ -107,16 +107,18 @@ void threadFunc(int idx) {
         g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
                                        // 加起来等于总操作数即可结束循环
       } else {
-        g_ctx.rings[to_thread].enqueue(&req[request_cnt]);
+        g_ctx.rings[to_thread][idx].enqueue(&req[request_cnt]);
       }
       request_cnt++;
     }
-    for (int i = 0; i < kPullNumber; i++) {
-      Request *r;
-      ret = g_ctx.rings[idx].try_dequeue(r);
-      if (ret) {
-        hash_map[r->key] = r->value;
-        g_ctx.finished_cnt[idx].val++;
+    Request *r;
+    for (int i = 0; i < g_ctx.thread_num; i++) {
+      for (int j = 0; j < kPullNumber; j++) {
+        ret = g_ctx.rings[idx][i].try_dequeue(r);
+        if (ret) {
+          hash_map[r->key] = r->value;
+          g_ctx.finished_cnt[idx].val++;
+        }
       }
     }
   }
@@ -141,19 +143,21 @@ void threadFunc(int idx) {
         g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
                                        // 加起来等于总操作数即可结束循环
       } else {
-        g_ctx.rings[to_thread].enqueue(&req[request_cnt]);
+        g_ctx.rings[to_thread][idx].enqueue(&req[request_cnt]);
       }
       request_cnt++;
     }
-    for (int i = 0; i < kPullNumber; i++) {
-      Request *r;
-      ret = g_ctx.rings[idx].try_dequeue(r);
-      if (ret) {
-        int value = hash_map[r->key];
-        if (value == 0) {
-          invalid_cnt++;
+    Request *r;
+    for (int i = 0; i < g_ctx.thread_num; i++) {
+      for (int j = 0; j < kPullNumber; j++) {
+        ret = g_ctx.rings[idx][i].try_dequeue(r);
+        if (ret) {
+          int value = hash_map[r->key];
+          if (value == 0) {
+            invalid_cnt++;
+          }
+          g_ctx.finished_cnt[idx].val++;
         }
-        g_ctx.finished_cnt[idx].val++;
       }
     }
   }
@@ -169,13 +173,17 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
-  printf("ring moodycamel test, %d write/read op per thread\n", kOpsPerThread);
+  printf("SPSC readerwriterqueue test, %d write/read op per thread\n",
+         kOpsPerThread);
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
   g_ctx.finished_cnt.resize(g_ctx.thread_num);
   for (int i = 0; i < g_ctx.thread_num; i++) {
-    g_ctx.rings.emplace_back(4194304); // 4194304 大小的 ring
+    g_ctx.rings.emplace_back();
+    for (int j = 0; j < g_ctx.thread_num; j++) {
+      g_ctx.rings[i].emplace_back(4194304);
+    }
   }
 
   for (int i = 0; i < g_ctx.thread_num; i++) {
