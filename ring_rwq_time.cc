@@ -104,11 +104,19 @@ void threadFunc(int idx) {
   int ring_ops = 0;
   int64_t hash_time_sum = 0;
   int hash_ops = 0;
+  int64_t calc_time_sum = 0;
+  int calc_ops = 0;
   while (should_thread_run) {
     for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
+      time_begin = std::chrono::high_resolution_clock::now();
       uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
                                  req[request_cnt].key.length(), 0, _wyp);
       int to_thread = key_hash % g_ctx.thread_num;
+      time_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::high_resolution_clock::now() - time_begin)
+                         .count();
+      calc_time_sum += time_elapsed;
+      calc_ops++;
       if (to_thread == idx) { // 就是我，不转移了
         time_begin = std::chrono::high_resolution_clock::now();
         hash_map[req[request_cnt].key] = req[request_cnt].value;
@@ -162,8 +170,10 @@ void threadFunc(int idx) {
   pthread_barrier_wait(&barrier3);
   printf("time sum %ld, ring_ops %d, %.4f ns/op\n", time_sum, ring_ops,
          static_cast<double>(time_sum) / ring_ops);
-  printf("hash time sum %ld, hash_ops %d, %.4f ns/op\n", hash_time_sum,
+  printf("hashmap time sum %ld, hash_ops %d, %.4f ns/op\n", hash_time_sum,
          hash_ops, static_cast<double>(hash_time_sum) / hash_ops);
+  printf("calc hash time sum %ld, hash_ops %d, %.4f ns/op\n", calc_time_sum,
+         hash_ops, static_cast<double>(calc_time_sum) / calc_ops);
 
   int invalid_cnt = 0;
   request_cnt = 0;
