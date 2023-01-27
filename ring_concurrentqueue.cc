@@ -1,5 +1,4 @@
-#include "3rdparty/ring.h"
-#include "3rdparty/wyhash.h"
+#include "3rdparty/concurrentqueue.h"
 #include <ankerl/unordered_dense.h>
 #include <cstdint>
 #include <functional>
@@ -16,8 +15,6 @@
 using std::string;
 using std::thread;
 using std::vector;
-using ReadLock = std::shared_lock<std::shared_mutex>;
-using WriteLock = std::unique_lock<std::shared_mutex>;
 
 constexpr int kOpsPerThread = 25000000; // 每个线程执行多少次读/写操作
 
@@ -30,14 +27,16 @@ struct Request {
   string key;
   int64_t value;
 };
+using MoodyQueue = moodycamel::ConcurrentQueue<Request *>;
 
 struct GlobalContext {
   int thread_num;
   int start_core;
 
   vector<thread> threads;
-  vector<int> finished_cnt; // thread_num 个
-  vector<rte_ring *> rings; // thread_num 个
+  vector<int> finished_cnt;                                   // thread_num 个
+  vector<MoodyQueue> rings;                                   // thread_num个
+  vector<ankerl::unordered_dense::map<string, int64_t>> maps; // thread_num 个
 };
 GlobalContext g_ctx;
 
@@ -82,86 +81,72 @@ void threadFunc(int idx) {
   vector<Request> req;
   req.reserve(kOpsPerThread);
   GenerateWriteRequests(req);
-  ankerl::unordered_dense::map<string, uint64_t>
-      hash_map; // 使用线程本地的变量而不是 g_ctx
-                // 中的一个哈希表数组，减少访存次数
-  hash_map.reserve(kOpsPerThread * 2);
 
   // test put
   int request_cnt = 0;
-  int handle_cnt = 0;
-  int ret;
+  bool ret;
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
   while (should_thread_run) {
     if (request_cnt < kOpsPerThread) {
-      uint64_t key_hash =
-          wyhash(req[request_cnt].key.c_str(), req[request_cnt].key.length(), 0,
-                 _wyp); // 使用快速的 wyhash（还行的优化）
+      int key_hash = hasher(req[request_cnt].key);
+      if (key_hash < 0) {
+        key_hash = -key_hash;
+      }
       int to_thread = key_hash % g_ctx.thread_num;
       if (to_thread == idx) { // 就是我，不转移了
-        hash_map[req[request_cnt].key] = req[request_cnt].value;
-        handle_cnt++; // 所有线程 finished_cnt
-                      // 加起来等于总操作数即可结束循环
+        g_ctx.maps[idx][req[request_cnt].key] = req[request_cnt].value;
+        g_ctx.finished_cnt[idx]++; // 所有线程 finished_cnt
+                                   // 加起来等于总操作数即可结束循环
       } else {
-        while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
-                                       &req[request_cnt])) != 0)
-          ;
+        g_ctx.rings[to_thread].enqueue(&req[request_cnt]);
       }
       request_cnt++;
     }
-    void *ring_req_ptr;
-    ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-    if (ret == 0) {
-      auto *r = static_cast<Request *>(ring_req_ptr);
-      hash_map[r->key] = r->value;
-      handle_cnt++;
-    }
-    if (request_cnt >= kOpsPerThread) { // 减少更新全局次数（重要优化）
-      g_ctx.finished_cnt[idx] = handle_cnt;
+    Request *r;
+    ret = g_ctx.rings[idx].try_dequeue(r);
+    if (ret) {
+      g_ctx.maps[idx][r->key] = r->value;
+      g_ctx.finished_cnt[idx]++;
     }
   }
   pthread_barrier_wait(&barrier3);
 
   int invalid_cnt = 0;
   request_cnt = 0;
-  handle_cnt = 0;
   // test get
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
   while (should_thread_run) {
     if (request_cnt < kOpsPerThread) {
-      uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
-                                 req[request_cnt].key.length(), 0, _wyp);
+      int key_hash = hasher(req[request_cnt].key);
+      if (key_hash < 0) {
+        key_hash = -key_hash;
+      }
       int to_thread = key_hash % g_ctx.thread_num;
       if (to_thread == idx) { // 就是我，不转移了
-        int value = hash_map[req[request_cnt].key];
+        int value = g_ctx.maps[idx][req[request_cnt].key];
         if (value == 0) {
           invalid_cnt++;
         }
-        handle_cnt++; // 所有线程 finished_cnt
-                      // 加起来等于总操作数即可结束循环
+        g_ctx.finished_cnt[idx]++; // 所有线程 finished_cnt
+                                   // 加起来等于总操作数即可结束循环
       } else {
-        while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
-                                       &req[request_cnt])) != 0)
-          ;
+        g_ctx.rings[to_thread].enqueue(&req[request_cnt]);
       }
       request_cnt++;
     }
     void *ring_req_ptr;
-    ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-    if (ret == 0) {
-      auto *r = static_cast<Request *>(ring_req_ptr);
-      int value = hash_map[r->key];
+    Request *r;
+    ret = g_ctx.rings[idx].try_dequeue(r);
+    if (ret) {
+      int value = g_ctx.maps[idx][r->key];
       if (value == 0) {
         invalid_cnt++;
       }
-      handle_cnt++;
-    }
-    if (request_cnt >= kOpsPerThread) { // 减少更新全局次数
-      g_ctx.finished_cnt[idx] = handle_cnt;
+      g_ctx.finished_cnt[idx]++;
     }
   }
   pthread_barrier_wait(&barrier3);
@@ -179,10 +164,11 @@ int main(int argc, char *argv[]) {
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
+  g_ctx.maps.resize(g_ctx.thread_num);
   g_ctx.finished_cnt.resize(g_ctx.thread_num);
   for (int i = 0; i < g_ctx.thread_num; i++) {
-    g_ctx.rings.push_back(
-        rte_ring_create(4194304, RING_F_SC_DEQ)); // 单消费者多生产者
+    g_ctx.rings.emplace_back(4194304); // 4194304 大小的 ring
+    g_ctx.maps[i].reserve(kOpsPerThread * 2);
   }
 
   for (int i = 0; i < g_ctx.thread_num; i++) {

@@ -1,6 +1,6 @@
 # lock_or_rte_ring_benchmark
 
-谁会赢？
+谁会赢？全部重新测试，忘记开O3了！
 
 ## lock
 
@@ -40,6 +40,8 @@
 ```
 
 ### MPSC 16 线程
+
+优化：finished_cnt 更新方式、wyhash、哈希表放到局部减少访存次数
 
 ```
 [PUT] total 9.8068 Mops, in 40.7880 s
