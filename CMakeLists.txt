@@ -24,3 +24,9 @@ target_link_libraries(ringccqtest pthread unordered_dense::unordered_dense)
 
 add_executable(ringrwqtest ring_readerwriterqueue.cc)
 target_link_libraries(ringrwqtest pthread unordered_dense::unordered_dense)
+
+add_executable(ringrwqtimetest ring_rwq_time.cc)
+target_link_libraries(ringrwqtimetest pthread unordered_dense::unordered_dense)
+
+add_executable(ringccqtimetest ring_ccq_time.cc)
+target_link_libraries(ringccqtimetest pthread unordered_dense::unordered_dense)

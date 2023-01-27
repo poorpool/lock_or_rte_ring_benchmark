@@ -1,6 +1,7 @@
-#include "3rdparty/ring.h"
+#include "3rdparty/readerwriterqueue.h"
 #include "3rdparty/wyhash.h"
 #include <ankerl/unordered_dense.h>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -36,13 +37,14 @@ struct __attribute__((aligned(64))) PaddingInt { // cacheline 对齐
   int val;
 };
 
+using MoodyQueue = moodycamel::ReaderWriterQueue<Request *>;
 struct GlobalContext {
   int thread_num;
   int start_core;
 
   vector<thread> threads;
-  vector<PaddingInt> finished_cnt; // thread_num 个
-  vector<rte_ring *> rings;        // thread_num 个
+  vector<PaddingInt> finished_cnt;  // thread_num 个
+  vector<vector<MoodyQueue>> rings; // thread_num^2 个
 };
 GlobalContext g_ctx;
 
@@ -84,51 +86,84 @@ void threadFunc(int idx) {
   }
 
   std::hash<string> hasher;
+  ankerl::unordered_dense::map<string, int64_t> hash_map;
+  hash_map.reserve(kOpsPerThread * 2);
   vector<Request> req;
   req.reserve(kOpsPerThread);
   GenerateWriteRequests(req);
-  ankerl::unordered_dense::map<string, uint64_t>
-      hash_map; // 使用线程本地的变量而不是 g_ctx
-                // 中的一个哈希表数组，减少访存次数
-  hash_map.reserve(kOpsPerThread * 2);
 
   // test put
   int request_cnt = 0;
-  int ret;
+  bool ret;
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
+  std::chrono::time_point<std::chrono::high_resolution_clock> time_begin;
+  int64_t time_elapsed;
+  int64_t time_sum = 0;
+  int ring_ops = 0;
+  int64_t hash_time_sum = 0;
+  int hash_ops = 0;
   while (should_thread_run) {
     for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
-      uint64_t key_hash =
-          wyhash(req[request_cnt].key.c_str(), req[request_cnt].key.length(), 0,
-                 _wyp); // 使用快速的 wyhash（还行的优化）
+      uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
+                                 req[request_cnt].key.length(), 0, _wyp);
       int to_thread = key_hash % g_ctx.thread_num;
       if (to_thread == idx) { // 就是我，不转移了
+        time_begin = std::chrono::high_resolution_clock::now();
         hash_map[req[request_cnt].key] = req[request_cnt].value;
+        time_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - time_begin)
+                .count();
+        hash_time_sum += time_elapsed;
+        hash_ops++;
         g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
                                        // 加起来等于总操作数即可结束循环
       } else {
-        while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
-                                       &req[request_cnt])) != 0)
-          ;
+        time_begin = std::chrono::high_resolution_clock::now();
+        g_ctx.rings[to_thread][idx].enqueue(&req[request_cnt]);
+        time_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - time_begin)
+                .count();
+        time_sum += time_elapsed;
+        ring_ops++;
       }
       request_cnt++;
     }
-
-    for (int i = 0; i < kPullNumber; i++) {
-      void *ring_req_ptr;
-      ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-      if (ret == 0) {
-        auto *r = static_cast<Request *>(ring_req_ptr);
-        hash_map[r->key] = r->value;
-        g_ctx.finished_cnt[idx].val++;
-      } else {
-        break;
+    Request *r;
+    for (int i = 0; i < g_ctx.thread_num; i++) {
+      for (int j = 0; j < kPullNumber; j++) {
+        time_begin = std::chrono::high_resolution_clock::now();
+        ret = g_ctx.rings[idx][i].try_dequeue(r);
+        time_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - time_begin)
+                .count();
+        time_sum += time_elapsed;
+        ring_ops++;
+        if (ret) {
+          time_begin = std::chrono::high_resolution_clock::now();
+          hash_map[r->key] = r->value;
+          time_elapsed =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::high_resolution_clock::now() - time_begin)
+                  .count();
+          hash_time_sum += time_elapsed;
+          hash_ops++;
+          g_ctx.finished_cnt[idx].val++;
+        } else {
+          break; // 没 pull 出来这一轮就不 pull 了
+        }
       }
     }
   }
   pthread_barrier_wait(&barrier3);
+  printf("time sum %ld, ring_ops %d, %.4f ns/op\n", time_sum, ring_ops,
+         static_cast<double>(time_sum) / ring_ops);
+  printf("hash time sum %ld, hash_ops %d, %.4f ns/op\n", hash_time_sum,
+         hash_ops, static_cast<double>(hash_time_sum) / hash_ops);
 
   int invalid_cnt = 0;
   request_cnt = 0;
@@ -136,6 +171,8 @@ void threadFunc(int idx) {
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
+  time_sum = 0;
+  ring_ops = 0;
   while (should_thread_run) {
     for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
       uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
@@ -149,28 +186,43 @@ void threadFunc(int idx) {
         g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
                                        // 加起来等于总操作数即可结束循环
       } else {
-        while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
-                                       &req[request_cnt])) != 0)
-          ;
+        time_begin = std::chrono::high_resolution_clock::now();
+        g_ctx.rings[to_thread][idx].enqueue(&req[request_cnt]);
+        time_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - time_begin)
+                .count();
+        time_sum += time_elapsed;
+        ring_ops++;
       }
       request_cnt++;
     }
-    for (int i = 0; i < kPullNumber; i++) {
-      void *ring_req_ptr;
-      ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-      if (ret == 0) {
-        auto *r = static_cast<Request *>(ring_req_ptr);
-        int value = hash_map[r->key];
-        if (value == 0) {
-          invalid_cnt++;
+    Request *r;
+    for (int i = 0; i < g_ctx.thread_num; i++) {
+      for (int j = 0; j < kPullNumber; j++) {
+        time_begin = std::chrono::high_resolution_clock::now();
+        ret = g_ctx.rings[idx][i].try_dequeue(r);
+        time_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - time_begin)
+                .count();
+        time_sum += time_elapsed;
+        ring_ops++;
+        if (ret) {
+          int value = hash_map[r->key];
+          if (value == 0) {
+            invalid_cnt++;
+          }
+          g_ctx.finished_cnt[idx].val++;
+        } else {
+          break;
         }
-        g_ctx.finished_cnt[idx].val++;
-      } else {
-        break;
       }
     }
   }
   pthread_barrier_wait(&barrier3);
+  printf("time sum %ld, ring_ops %d, %.4f ns/op\n", time_sum, ring_ops,
+         static_cast<double>(time_sum) / ring_ops);
 
   if (invalid_cnt != 0) {
     printf("ERR %d: invalid_cnt %d", idx, invalid_cnt);
@@ -182,14 +234,17 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
-  printf("MPSC rte_ring test, %d write/read op per thread\n", kOpsPerThread);
+  printf("SPSC readerwriterqueue time test, %d write/read op per thread\n",
+         kOpsPerThread);
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
   g_ctx.finished_cnt.resize(g_ctx.thread_num);
   for (int i = 0; i < g_ctx.thread_num; i++) {
-    g_ctx.rings.push_back(
-        rte_ring_create(4194304, RING_F_SC_DEQ)); // 单消费者多生产者
+    g_ctx.rings.emplace_back();
+    for (int j = 0; j < g_ctx.thread_num; j++) {
+      g_ctx.rings[i].emplace_back(4194304);
+    }
   }
 
   for (int i = 0; i < g_ctx.thread_num; i++) {

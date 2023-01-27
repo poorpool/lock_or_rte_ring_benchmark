@@ -118,6 +118,8 @@ void threadFunc(int idx) {
         if (ret) {
           hash_map[r->key] = r->value;
           g_ctx.finished_cnt[idx].val++;
+        } else {
+          break;
         }
       }
     }
@@ -157,6 +159,8 @@ void threadFunc(int idx) {
             invalid_cnt++;
           }
           g_ctx.finished_cnt[idx].val++;
+        } else {
+          break;
         }
       }
     }

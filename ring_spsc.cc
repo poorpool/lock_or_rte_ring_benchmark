@@ -114,12 +114,15 @@ void threadFunc(int idx) {
     }
     void *ring_req_ptr;
     for (int i = 0; i < g_ctx.thread_num; i++) {
-      for (int j = 0; j < kPullNumber; j++) {
+      int pull_failed = 0;
+      for (int j = 0; pull_failed < 2 && j < kPullNumber; j++) {
         ret = rte_ring_dequeue(g_ctx.rings[idx][i], &ring_req_ptr);
         if (ret == 0) {
           auto *r = static_cast<Request *>(ring_req_ptr);
           hash_map[r->key] = r->value;
           g_ctx.finished_cnt[idx].val++;
+        } else {
+          pull_failed++;
         }
       }
     }
@@ -153,7 +156,8 @@ void threadFunc(int idx) {
     }
     void *ring_req_ptr;
     for (int i = 0; i < g_ctx.thread_num; i++) {
-      for (int j = 0; j < kPullNumber; j++) {
+      int pull_failed = 0;
+      for (int j = 0; pull_failed < 2 && j < kPullNumber; j++) {
         ret = rte_ring_dequeue(g_ctx.rings[idx][i], &ring_req_ptr);
         if (ret == 0) {
           auto *r = static_cast<Request *>(ring_req_ptr);
@@ -162,6 +166,8 @@ void threadFunc(int idx) {
             invalid_cnt++;
           }
           g_ctx.finished_cnt[idx].val++;
+        } else {
+          pull_failed++;
         }
       }
     }
