@@ -145,6 +145,19 @@ int main(int argc, char *argv[]) {
   for (int i = 0; i < g_ctx.thread_num; i++) {
     g_ctx.threads.emplace_back(threadFunc, i);
   }
+  if (g_ctx.start_core != -1) {
+    cpu_set_t cpuset;
+
+    CPU_ZERO(&cpuset); // 初始化CPU集合，将 cpuset 置为空
+    CPU_SET(g_ctx.thread_num + g_ctx.start_core,
+            &cpuset); // 将本进程绑定到 CPU 上
+
+    // 设置线程的 CPU 亲和性
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+      printf("Set CPU affinity failed\n");
+      exit(-1);
+    }
+  }
 
   // PUT
   pthread_barrier_init(&barrier1, nullptr, g_ctx.thread_num + 1);
