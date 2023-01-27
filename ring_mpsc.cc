@@ -31,13 +31,17 @@ struct Request {
   int64_t value;
 };
 
+struct __attribute__((aligned(64))) PaddingInt { // cacheline 对齐
+  int val;
+};
+
 struct GlobalContext {
   int thread_num;
   int start_core;
 
   vector<thread> threads;
-  vector<int> finished_cnt; // thread_num 个
-  vector<rte_ring *> rings; // thread_num 个
+  vector<PaddingInt> finished_cnt; // thread_num 个
+  vector<rte_ring *> rings;        // thread_num 个
 };
 GlobalContext g_ctx;
 
@@ -89,7 +93,6 @@ void threadFunc(int idx) {
 
   // test put
   int request_cnt = 0;
-  int handle_cnt = 0;
   int ret;
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
@@ -102,8 +105,8 @@ void threadFunc(int idx) {
       int to_thread = key_hash % g_ctx.thread_num;
       if (to_thread == idx) { // 就是我，不转移了
         hash_map[req[request_cnt].key] = req[request_cnt].value;
-        handle_cnt++; // 所有线程 finished_cnt
-                      // 加起来等于总操作数即可结束循环
+        g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
+                                       // 加起来等于总操作数即可结束循环
       } else {
         while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
                                        &req[request_cnt])) != 0)
@@ -116,17 +119,13 @@ void threadFunc(int idx) {
     if (ret == 0) {
       auto *r = static_cast<Request *>(ring_req_ptr);
       hash_map[r->key] = r->value;
-      handle_cnt++;
-    }
-    if (request_cnt >= kOpsPerThread) { // 减少更新全局次数（重要优化）
-      g_ctx.finished_cnt[idx] = handle_cnt;
+      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);
 
   int invalid_cnt = 0;
   request_cnt = 0;
-  handle_cnt = 0;
   // test get
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
@@ -141,8 +140,8 @@ void threadFunc(int idx) {
         if (value == 0) {
           invalid_cnt++;
         }
-        handle_cnt++; // 所有线程 finished_cnt
-                      // 加起来等于总操作数即可结束循环
+        g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
+                                       // 加起来等于总操作数即可结束循环
       } else {
         while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
                                        &req[request_cnt])) != 0)
@@ -158,10 +157,7 @@ void threadFunc(int idx) {
       if (value == 0) {
         invalid_cnt++;
       }
-      handle_cnt++;
-    }
-    if (request_cnt >= kOpsPerThread) { // 减少更新全局次数
-      g_ctx.finished_cnt[idx] = handle_cnt;
+      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);
@@ -176,6 +172,7 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
+  printf("MPSC rte_ring test, %d write/read op per thread\n", kOpsPerThread);
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
@@ -222,14 +219,14 @@ int main(int argc, char *argv[]) {
   while (should_thread_run) {
     int64_t sum = 0;
     for (int i = 0; i < g_ctx.thread_num; i++) {
-      sum += g_ctx.finished_cnt[i];
+      sum += g_ctx.finished_cnt[i].val;
     }
     if (sum == static_cast<int64_t>(kOpsPerThread) * g_ctx.thread_num) {
       should_thread_run = false;
     }
   }
   for (int i = 0; i < g_ctx.thread_num; i++) {
-    g_ctx.finished_cnt[i] = 0;
+    g_ctx.finished_cnt[i].val = 0;
   }
 
   // PUT 后计时结束
@@ -261,7 +258,7 @@ int main(int argc, char *argv[]) {
   while (should_thread_run) {
     int64_t sum = 0;
     for (int i = 0; i < g_ctx.thread_num; i++) {
-      sum += g_ctx.finished_cnt[i];
+      sum += g_ctx.finished_cnt[i].val;
     }
     if (sum == static_cast<int64_t>(kOpsPerThread) * g_ctx.thread_num) {
       should_thread_run = false;

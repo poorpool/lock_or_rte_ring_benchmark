@@ -132,6 +132,7 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
+  printf("lock test, %d write/read op per thread\n", kOpsPerThread);
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
