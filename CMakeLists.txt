@@ -13,20 +13,25 @@ find_package(unordered_dense CONFIG REQUIRED)
 add_executable(locktest lock.cc)
 target_link_libraries(locktest pthread unordered_dense::unordered_dense)
 
-add_executable(ringmpsctest ring_mpsc.cc)
-target_link_libraries(ringmpsctest pthread unordered_dense::unordered_dense)
+add_executable(ring_mpsc_rte_test ring_mpsc_rte.cc)
+target_link_libraries(ring_mpsc_rte_test pthread unordered_dense::unordered_dense)
 
-add_executable(ringspsctest ring_spsc.cc)
-target_link_libraries(ringspsctest pthread unordered_dense::unordered_dense)
+add_executable(ring_spsc_rte_test ring_spsc_rte.cc)
+target_link_libraries(ring_spsc_rte_test pthread unordered_dense::unordered_dense)
 
-add_executable(ringccqtest ring_concurrentqueue.cc)
-target_link_libraries(ringccqtest pthread unordered_dense::unordered_dense)
+add_executable(ring_mpsc_moody_test ring_mpsc_moody.cc)
+target_link_libraries(ring_mpsc_moody_test pthread unordered_dense::unordered_dense)
 
-add_executable(ringrwqtest ring_readerwriterqueue.cc)
-target_link_libraries(ringrwqtest pthread unordered_dense::unordered_dense)
+add_executable(ring_spsc_moody_test ring_spsc_moody.cc)
+target_link_libraries(ring_spsc_moody_test pthread unordered_dense::unordered_dense)
 
-add_executable(ringrwqtimetest ring_rwq_time.cc)
-target_link_libraries(ringrwqtimetest pthread unordered_dense::unordered_dense)
+# add_executable(ringrwqtimetest ring_rwq_time.cc)
+# target_link_libraries(ringrwqtimetest pthread unordered_dense::unordered_dense)
 
-add_executable(ringccqtimetest ring_ccq_time.cc)
-target_link_libraries(ringccqtimetest pthread unordered_dense::unordered_dense)
+# add_executable(ringccqtimetest ring_ccq_time.cc)
+# target_link_libraries(ringccqtimetest pthread unordered_dense::unordered_dense)
+
+add_executable(ring_time_mpsc_rte ring_rdtsc_mpsc_rte.cc)
+target_link_libraries(ring_time_mpsc_rte pthread unordered_dense::unordered_dense)
+add_executable(ring_time_spsc_rte ring_rdtsc_spsc_rte.cc)
+target_link_libraries(ring_time_spsc_rte pthread unordered_dense::unordered_dense)

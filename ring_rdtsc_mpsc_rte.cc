@@ -68,6 +68,14 @@ void GenerateWriteRequests(vector<Request> &kvs) {
   }
 }
 
+// NOLINTBEGIN
+static inline uint64_t rdtsc() {
+  uint64_t rax, rdx;
+  asm volatile("rdtscp\n" : "=a"(rax), "=d"(rdx) : : "%ecx");
+  return (rdx << 32) + rax;
+}
+// NOLINTEND
+
 bool should_thread_run;
 void threadFunc(int idx) {
   if (g_ctx.start_core != -1) {
@@ -93,6 +101,15 @@ void threadFunc(int idx) {
                 // 中的一个哈希表数组，减少访存次数
   hash_map.reserve(kOpsPerThread * 2);
 
+  // 时间统计
+  uint64_t cycle_start;
+  uint64_t hash_cycles = 0; // 哈希函数
+  uint64_t hash_op_num = 0;
+  uint64_t map_cycles = 0; // 哈希表
+  uint64_t map_op_num = 0;
+  uint64_t ring_cycles = 0; // ring 操作
+  uint64_t ring_op_num = 0;
+
   // test put
   int request_cnt = 0;
   int ret;
@@ -101,62 +118,106 @@ void threadFunc(int idx) {
   pthread_barrier_wait(&barrier2);
   while (should_thread_run) {
     for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
+      cycle_start = rdtsc();
       uint64_t key_hash =
           wyhash(req[request_cnt].key.c_str(), req[request_cnt].key.length(), 0,
                  _wyp); // 使用快速的 wyhash（还行的优化）
+      hash_cycles += rdtsc() - cycle_start;
+      hash_op_num++;
       int to_thread = key_hash % g_ctx.thread_num;
       if (to_thread == idx) { // 就是我，不转移了
+        cycle_start = rdtsc();
         hash_map[req[request_cnt].key] = req[request_cnt].value;
+        map_cycles += rdtsc() - cycle_start;
+        map_op_num++;
         g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
                                        // 加起来等于总操作数即可结束循环
       } else {
+        cycle_start = rdtsc();
         while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
                                        &req[request_cnt])) != 0)
           ;
+        ring_cycles += rdtsc() - cycle_start;
+        ring_op_num += 1;
       }
       request_cnt++;
     }
 
+    cycle_start = rdtsc();
     unsigned int n = rte_ring_dequeue_burst(g_ctx.rings[idx], deque_requests,
                                             kPullNumber, nullptr);
+    ring_cycles += rdtsc() - cycle_start;
+    ring_op_num += n ? n : 1;
     for (int i = 0; i < n; i++) {
       auto *r = static_cast<Request *>(deque_requests[i]);
+      cycle_start = rdtsc();
       hash_map[r->key] = r->value;
+      map_cycles += rdtsc() - cycle_start;
+      map_op_num++;
       g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);
+  printf("#%d hash func cycle %ld, op_num %ld, cycle/op %.4f\n", idx,
+         hash_cycles, hash_op_num,
+         static_cast<double>(hash_cycles) / hash_op_num);
+  printf("#%d hashmap write cycle %ld, op_num %ld, cycle/op %.4f\n", idx,
+         map_cycles, map_op_num, static_cast<double>(map_cycles) / map_op_num);
+  printf("#%d ring cycle %ld, op_num %ld, cycle/op %.4f\n", idx, ring_cycles,
+         ring_op_num, static_cast<double>(ring_cycles) / ring_op_num);
+  printf("\n");
 
   int invalid_cnt = 0;
   request_cnt = 0;
+  hash_cycles = 0; // 哈希函数
+  hash_op_num = 0;
+  map_cycles = 0; // 哈希表
+  map_op_num = 0;
+  ring_cycles = 0; // ring 操作
+  ring_op_num = 0;
   // test get
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
   while (should_thread_run) {
     for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
+      cycle_start = rdtsc();
       uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
                                  req[request_cnt].key.length(), 0, _wyp);
+      hash_cycles += rdtsc() - cycle_start;
+      hash_op_num++;
       int to_thread = key_hash % g_ctx.thread_num;
       if (to_thread == idx) { // 就是我，不转移了
+        cycle_start = rdtsc();
         int value = hash_map[req[request_cnt].key];
+        map_cycles += rdtsc() - cycle_start;
+        map_op_num++;
         if (value == 0) {
           invalid_cnt++;
         }
         g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
                                        // 加起来等于总操作数即可结束循环
       } else {
+        cycle_start = rdtsc();
         while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread],
                                        &req[request_cnt])) != 0)
           ;
+        ring_cycles += rdtsc() - cycle_start;
+        ring_op_num += 1;
       }
       request_cnt++;
     }
+    cycle_start = rdtsc();
     unsigned int n = rte_ring_dequeue_burst(g_ctx.rings[idx], deque_requests,
                                             kPullNumber, nullptr);
+    ring_cycles += rdtsc() - cycle_start;
+    ring_op_num += n ? n : 1;
     for (int i = 0; i < n; i++) {
       auto *r = static_cast<Request *>(deque_requests[i]);
+      cycle_start = rdtsc();
       int value = hash_map[r->key];
+      map_cycles += rdtsc() - cycle_start;
+      map_op_num++;
       if (value == 0) {
         invalid_cnt++;
       }
@@ -164,6 +225,14 @@ void threadFunc(int idx) {
     }
   }
   pthread_barrier_wait(&barrier3);
+  printf("#%d hash func cycle %ld, op_num %ld, cycle/op %.4f\n", idx,
+         hash_cycles, hash_op_num,
+         static_cast<double>(hash_cycles) / hash_op_num);
+  printf("#%d hashmap read cycle %ld, op_num %ld, cycle/op %.4f\n", idx,
+         map_cycles, map_op_num, static_cast<double>(map_cycles) / map_op_num);
+  printf("#%d ring cycle %ld, op_num %ld, cycle/op %.4f\n", idx, ring_cycles,
+         ring_op_num, static_cast<double>(ring_cycles) / ring_op_num);
+  printf("\n");
 
   if (invalid_cnt != 0) {
     printf("ERR %d: invalid_cnt %d", idx, invalid_cnt);
@@ -175,7 +244,8 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
-  printf("MPSC rte_ring test, %d write/read op per thread\n", kOpsPerThread);
+  printf("MPSC rte_ring rdtsc time test, %d write/read op per thread\n",
+         kOpsPerThread);
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
