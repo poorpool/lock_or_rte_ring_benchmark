@@ -87,6 +87,7 @@ void threadFunc(int idx) {
   vector<Request> req;
   req.reserve(kOpsPerThread);
   GenerateWriteRequests(req);
+  void *deque_requests[kPullNumber];
   ankerl::unordered_dense::map<string, uint64_t>
       hash_map; // 使用线程本地的变量而不是 g_ctx
                 // 中的一个哈希表数组，减少访存次数
@@ -116,16 +117,12 @@ void threadFunc(int idx) {
       request_cnt++;
     }
 
-    for (int i = 0; i < kPullNumber; i++) {
-      void *ring_req_ptr;
-      ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-      if (ret == 0) {
-        auto *r = static_cast<Request *>(ring_req_ptr);
-        hash_map[r->key] = r->value;
-        g_ctx.finished_cnt[idx].val++;
-      } else {
-        break;
-      }
+    unsigned int n = rte_ring_dequeue_burst(g_ctx.rings[idx], deque_requests,
+                                            kPullNumber, nullptr);
+    for (int i = 0; i < n; i++) {
+      auto *r = static_cast<Request *>(deque_requests[i]);
+      hash_map[r->key] = r->value;
+      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);
@@ -155,19 +152,15 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    for (int i = 0; i < kPullNumber; i++) {
-      void *ring_req_ptr;
-      ret = rte_ring_dequeue(g_ctx.rings[idx], &ring_req_ptr);
-      if (ret == 0) {
-        auto *r = static_cast<Request *>(ring_req_ptr);
-        int value = hash_map[r->key];
-        if (value == 0) {
-          invalid_cnt++;
-        }
-        g_ctx.finished_cnt[idx].val++;
-      } else {
-        break;
+    unsigned int n = rte_ring_dequeue_burst(g_ctx.rings[idx], deque_requests,
+                                            kPullNumber, nullptr);
+    for (int i = 0; i < n; i++) {
+      auto *r = static_cast<Request *>(deque_requests[i]);
+      int value = hash_map[r->key];
+      if (value == 0) {
+        invalid_cnt++;
       }
+      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);

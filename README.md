@@ -11,13 +11,13 @@
 |lock|慢|快|
 |ring|最快|最快|
 
-最快的方式是**使用 Jemalloc 的 SPSC ring**（moodycamel::readerwriterqueue，rte_ring也行，速度差不多）。
+最快的方式是**使用 Jemalloc 的 SPSC rte_ring**。
 
 jemalloc 对于 SPSC ring 场景是一个好的优化，其他场景不明显。
 
-moodycamel ring 是一个 header-only 的 c++ 类库，使用很方便、很自然。MPMC 版本叫 concurrentqueue，SPSC 版本叫 readerwriterqueue。
+moodycamel ring 是一个 header-only 的 c++ 类库，使用很方便、很自然。MPMC 版本叫 concurrentqueue（本测试中只使用到 MPSC），SPSC 版本叫 readerwriterqueue。
 
-SPSC moodycamel 略快于 SPSC rte_ring 远快于 MPSC rte_ring 快于 MPMC moodycamel
+SPSC rte_ring 快于 SPSC moodycamel 快于 MPSC moodycamel 快于 MPSC rte_ring
 
 在单线程 SPSC 条件下，一次哈希表写操作 200ns，SPSC ring 操作 30ns。16 SPSC 线程条件下，一次哈希表写操作 350ns，SPSC ring 操作 55ns。
 
@@ -38,9 +38,9 @@ https://github.com/poorpool/mem-meta-kv-benchmark 这是一个纯净的哈希表
 
 - 使用 jemalloc
 - 使用 SPSC ring 在线程之间传递数据
-- moodycamel::readerwriterqueue 因为它是一个纯粹的类，编程可能更方便
+- moodycamel 因为它是一个纯粹的类，编程可能更方便，性能则没有特别突出的地方
 - 如果有什么数据放在全局共享的数组，将其对齐 cacheline，防止不停 cache 失效
-- 如果要 poll 一个 ring，就连续多 poll 几下它再去干别的事情，poll 到空就停止这一轮的 poll
+- ring 使用批量 poll 接口
 
 ## lock
 
@@ -55,28 +55,26 @@ using WriteLock = std::unique_lock<std::shared_mutex>;
 
 key 锁 100000 个和 10000000 个的性能差距基本没有，主要在 map 锁上面。
 
-每个线程循环做这种事情：先处理 32 个请求，再 poll 32 次 ring 处理别人发过来的请求。
-
-如果 poll 到空就停止，下一轮再 poll，这样可以有效减少空 poll 次数，总 pull 降低为原来的六分之一吧。ring 耗时大概 50ns 一次。一次操作平均要造成两次多的入队出队（空 poll 也算上）
+每个线程循环做这种事情：先处理 32 个请求，再 poll 32 次 ring 处理别人发过来的请求。Poll 尽可能使用批量 poll 接口（rte_ring_dequeue_burst、concurrentqueue 的 try_dequeue_bulk，readerwriaterqueue 无批量接口）
 
 ### lock 先读后写 1 线程
 
 ```
 lock test, 25000000 write/read op per thread
-[PUT] total 4.1310 Mops, in 6.0518 s
-      per-thread 4.1310 Mops
-[GET] total 5.0279 Mops, in 4.9722 s
-      per-thread 5.0279 Mops
+[PUT] total 3.8458 Mops, in 6.5006 s
+      per-thread 3.8458 Mops
+[GET] total 5.0112 Mops, in 4.9888 s
+      per-thread 5.0112 Mops
 ```
 
 ### lock 先读后写 16 线程
 
 ```
 lock test, 25000000 write/read op per thread
-[PUT] total 9.1336 Mops, in 43.7943 s
-      per-thread 0.5709 Mops
-[GET] total 17.7169 Mops, in 22.5773 s
-      per-thread 1.1073 Mops
+[PUT] total 8.0801 Mops, in 49.5043 s
+      per-thread 0.5050 Mops
+[GET] total 17.6064 Mops, in 22.7190 s
+      per-thread 1.1004 Mops
 ```
 
 ## ring
@@ -91,40 +89,40 @@ lock test, 25000000 write/read op per thread
 
 ```
 MPSC rte_ring test, 25000000 write/read op per thread
-[PUT] total 5.0949 Mops, in 4.9069 s
-      per-thread 5.0949 Mops
-[GET] total 5.8182 Mops, in 4.2969 s
-      per-thread 5.8182 Mops
+[PUT] total 5.1391 Mops, in 4.8647 s
+      per-thread 5.1391 Mops
+[GET] total 5.3467 Mops, in 4.6758 s
+      per-thread 5.3467 Mops
 ```
 
 ### rte_ring MPSC 16 线程
 
 ```
 MPSC rte_ring test, 25000000 write/read op per thread
-[PUT] total 24.9208 Mops, in 16.0508 s
-      per-thread 1.5576 Mops
-[GET] total 26.3405 Mops, in 15.1857 s
-      per-thread 1.6463 Mops
+[PUT] total 32.7922 Mops, in 12.1980 s
+      per-thread 2.0495 Mops
+[GET] total 31.3813 Mops, in 12.7464 s
+      per-thread 1.9613 Mops
 ```
 
 ### rte_ring SPSC 1 线程
 
 ```
 SPSC rte_ring test, 25000000 write/read op per thread
-[PUT] total 4.9330 Mops, in 5.0679 s
-      per-thread 4.9330 Mops
-[GET] total 5.8892 Mops, in 4.2450 s
-      per-thread 5.8892 Mops
+[PUT] total 5.1360 Mops, in 4.8676 s
+      per-thread 5.1360 Mops
+[GET] total 6.2702 Mops, in 3.9871 s
+      per-thread 6.2702 Mops
 ```
 
 ### rte_ring SPSC 16 线程
 
 ```
 SPSC rte_ring test, 25000000 write/read op per thread
-[PUT] total 37.8342 Mops, in 10.5724 s
-      per-thread 2.3646 Mops
-[GET] total 38.1623 Mops, in 10.4815 s
-      per-thread 2.3851 Mops
+[PUT] total 42.9301 Mops, in 9.3175 s
+      per-thread 2.6831 Mops
+[GET] total 47.3997 Mops, in 8.4389 s
+      per-thread 2.9625 Mops
 ```
 
 ### moodycamel MPSC 1 线程
@@ -132,21 +130,21 @@ SPSC rte_ring test, 25000000 write/read op per thread
 https://github.com/cameron314/concurrentqueue
 
 ```
-ring moodycamel test, 25000000 write/read op per thread
-[PUT] total 5.0460 Mops, in 4.9544 s
-      per-thread 5.0460 Mops
-[GET] total 5.2871 Mops, in 4.7285 s
-      per-thread 5.2871 Mops
+ring moodycamel MPMC test, 25000000 write/read op per thread
+[PUT] total 5.1532 Mops, in 4.8513 s
+      per-thread 5.1532 Mops
+[GET] total 5.2392 Mops, in 4.7717 s
+      per-thread 5.2392 Mops
 ```
 
 ### moodycamel MPSC 16 线程
 
 ```
-ring moodycamel test, 25000000 write/read op per thread
-[PUT] total 19.5609 Mops, in 20.4490 s
-      per-thread 1.2226 Mops
-[GET] total 15.9355 Mops, in 25.1012 s
-      per-thread 0.9960 Mops
+ring moodycamel MPMC test, 25000000 write/read op per thread
+[PUT] total 37.8641 Mops, in 10.5641 s
+      per-thread 2.3665 Mops
+[GET] total 40.0319 Mops, in 9.9920 s
+      per-thread 2.5020 Mops
 ```
 
 ### moodycamel SPSC 1 线程
@@ -155,20 +153,20 @@ https://github.com/cameron314/readerwriterqueue
 
 ```
 SPSC readerwriterqueue test, 25000000 write/read op per thread
-[PUT] total 5.1828 Mops, in 4.8236 s
-      per-thread 5.1828 Mops
-[GET] total 5.9561 Mops, in 4.1974 s
-      per-thread 5.9561 Mops
+[PUT] total 5.1628 Mops, in 4.8423 s
+      per-thread 5.1628 Mops
+[GET] total 5.6211 Mops, in 4.4475 s
+      per-thread 5.6211 Mops
 ```
 
 ### moodycamel SPSC 16 线程
 
 ```
 SPSC readerwriterqueue test, 25000000 write/read op per thread
-[PUT] total 38.7467 Mops, in 10.3235 s
-      per-thread 2.4217 Mops
-[GET] total 39.3582 Mops, in 10.1631 s
-      per-thread 2.4599 Mops
+[PUT] total 39.3403 Mops, in 10.1677 s
+      per-thread 2.4588 Mops
+[GET] total 43.8345 Mops, in 9.1252 s
+      per-thread 2.7397 Mops
 ```
 
 ## 附录 moodycamel SPSC time test

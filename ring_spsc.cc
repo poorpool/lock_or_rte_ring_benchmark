@@ -87,6 +87,7 @@ void threadFunc(int idx) {
   ankerl::unordered_dense::map<string, int64_t> hash_map;
   hash_map.reserve(kOpsPerThread * 2);
   vector<Request> req;
+  void *deque_requests[kPullNumber];
   req.reserve(kOpsPerThread);
   GenerateWriteRequests(req);
 
@@ -112,18 +113,13 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    void *ring_req_ptr;
     for (int i = 0; i < g_ctx.thread_num; i++) {
-      int pull_failed = 0;
-      for (int j = 0; pull_failed < 2 && j < kPullNumber; j++) {
-        ret = rte_ring_dequeue(g_ctx.rings[idx][i], &ring_req_ptr);
-        if (ret == 0) {
-          auto *r = static_cast<Request *>(ring_req_ptr);
-          hash_map[r->key] = r->value;
-          g_ctx.finished_cnt[idx].val++;
-        } else {
-          pull_failed++;
-        }
+      unsigned int n = rte_ring_dequeue_burst(
+          g_ctx.rings[idx][i], deque_requests, kPullNumber, nullptr);
+      for (int j = 0; j < n; j++) {
+        auto *r = static_cast<Request *>(deque_requests[j]);
+        hash_map[r->key] = r->value;
+        g_ctx.finished_cnt[idx].val++;
       }
     }
   }
@@ -154,21 +150,16 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    void *ring_req_ptr;
     for (int i = 0; i < g_ctx.thread_num; i++) {
-      int pull_failed = 0;
-      for (int j = 0; pull_failed < 2 && j < kPullNumber; j++) {
-        ret = rte_ring_dequeue(g_ctx.rings[idx][i], &ring_req_ptr);
-        if (ret == 0) {
-          auto *r = static_cast<Request *>(ring_req_ptr);
-          int value = hash_map[r->key];
-          if (value == 0) {
-            invalid_cnt++;
-          }
-          g_ctx.finished_cnt[idx].val++;
-        } else {
-          pull_failed++;
+      unsigned int n = rte_ring_dequeue_burst(
+          g_ctx.rings[idx][i], deque_requests, kPullNumber, nullptr);
+      for (int j = 0; j < n; j++) {
+        auto *r = static_cast<Request *>(deque_requests[j]);
+        int value = hash_map[r->key];
+        if (value == 0) {
+          invalid_cnt++;
         }
+        g_ctx.finished_cnt[idx].val++;
       }
     }
   }

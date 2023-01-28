@@ -111,15 +111,11 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    for (int i = 0; i < kPullNumber; i++) {
-      Request *r;
-      ret = g_ctx.rings[idx].try_dequeue(r);
-      if (ret) {
-        hash_map[r->key] = r->value;
-        g_ctx.finished_cnt[idx].val++;
-      } else {
-        break;
-      }
+    Request *r[kPullNumber];
+    int n = g_ctx.rings[idx].try_dequeue_bulk(r, kPullNumber);
+    for (int i = 0; i < n; i++) {
+      hash_map[r[i]->key] = r[i]->value;
+      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);
@@ -147,18 +143,14 @@ void threadFunc(int idx) {
       }
       request_cnt++;
     }
-    for (int i = 0; i < kPullNumber; i++) {
-      Request *r;
-      ret = g_ctx.rings[idx].try_dequeue(r);
-      if (ret) {
-        int value = hash_map[r->key];
-        if (value == 0) {
-          invalid_cnt++;
-        }
-        g_ctx.finished_cnt[idx].val++;
-      } else {
-        break;
+    Request *r[kPullNumber];
+    int n = g_ctx.rings[idx].try_dequeue_bulk(r, kPullNumber);
+    for (int i = 0; i < n; i++) {
+      int value = hash_map[r[i]->key];
+      if (value == 0) {
+        invalid_cnt++;
       }
+      g_ctx.finished_cnt[idx].val++;
     }
   }
   pthread_barrier_wait(&barrier3);
@@ -173,7 +165,8 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
-  printf("ring moodycamel test, %d write/read op per thread\n", kOpsPerThread);
+  printf("ring moodycamel MPMC test, %d write/read op per thread\n",
+         kOpsPerThread);
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
