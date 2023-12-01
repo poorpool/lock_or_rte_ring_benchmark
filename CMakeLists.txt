@@ -35,3 +35,14 @@ add_executable(ring_time_mpsc_rte ring_rdtsc_mpsc_rte.cc)
 target_link_libraries(ring_time_mpsc_rte pthread unordered_dense::unordered_dense)
 add_executable(ring_time_spsc_rte ring_rdtsc_spsc_rte.cc)
 target_link_libraries(ring_time_spsc_rte pthread unordered_dense::unordered_dense)
+
+add_executable(lock_rocksdb
+    lock_rocksdb.cc
+)
+target_link_libraries(lock_rocksdb 
+    rocksdb lz4 pthread -lz -lsnappy -lbz2 -lzstd -ldl)
+
+add_executable(ring_spsc_rocksdb ring_spsc_rocksdb.cc)
+target_link_libraries(ring_spsc_rocksdb
+    pthread unordered_dense::unordered_dense
+    rocksdb lz4 pthread -lz -lsnappy -lbz2 -lzstd -ldl)

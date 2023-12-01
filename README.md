@@ -455,3 +455,29 @@ SPSC rte_ring rdtsc time test, 25000000 write/read op per thread
 #15 hashmap read cycle 22185822002, op_num 25000368, cycle/op 887.4198
 #15 ring cycle 5333135148, op_num 59560998, cycle/op 89.5407
 ```
+
+## RocksDB 版本
+
+为了验证：16 个线程用一个 DB 实例和 16 个线程用 16 个 DB 实例相比，后者更快
+
+```
+~/lock_or_rte_ring_benchmark-master ··························· with cyx@s53 at 11:11:08
+❯ ./build/ring_spsc_rocksdb 16 0
+SPSC rocksdb test, 1000000 write/read op per thread
+[PUT] total 5.9137 Mops, in 2.7056 s
+      per-thread 0.3696 Mops
+[GET] total 6.4411 Mops, in 2.4840 s
+      per-thread 0.4026 Mops
+[DELETE] total 6.0866 Mops, in 2.6287 s
+      per-thread 0.3804 Mops
+
+~/lock_or_rte_ring_benchmark-master ·················· took 25s with cyx@s53 at 11:11:36
+❯ ./build/lock_rocksdb 16 0     
+single rocksdb test, 1000000 write/read op per thread
+[PUT] total 3.3130 Mops, in 4.8295 s
+      per-thread 0.2071 Mops
+[GET] total 1.0553 Mops, in 15.1616 s
+      per-thread 0.0660 Mops
+[DELETE] total 3.3212 Mops, in 4.8175 s
+      per-thread 0.2076 Mops
+```

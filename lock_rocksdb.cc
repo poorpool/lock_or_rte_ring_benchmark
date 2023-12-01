@@ -1,28 +1,27 @@
-#include "3rdparty/ring.h"
-#include "3rdparty/wyhash.h"
 #include <ankerl/unordered_dense.h>
-#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <pthread.h>
 #include <random>
+#include <rocksdb/db.h>
+#include <rocksdb/utilities/options_util.h>
 #include <shared_mutex>
 #include <string>
 #include <sys/time.h>
 #include <thread>
 #include <vector>
-
 using std::string;
 using std::thread;
 using std::vector;
 using ReadLock = std::shared_lock<std::shared_mutex>;
 using WriteLock = std::unique_lock<std::shared_mutex>;
 
-constexpr int kOpsPerThread = 25000000; // 每个线程执行多少次读/写操作
-constexpr int kPullNumber = 32;         // 连续 pull 几下
+constexpr int kOpsPerThread = 1000000; // 每个线程执行多少次读/写操作
 
 pthread_barrier_t barrier1, barrier2, barrier3;
+
+rocksdb::DB *db;
 
 enum OP_TYPE { kOpTypeRead = 1, kOpTypeWrite = 2 };
 
@@ -32,17 +31,11 @@ struct Request {
   int64_t value;
 };
 
-struct __attribute__((aligned(64))) PaddingInt { // cacheline 对齐
-  int val;
-};
-
 struct GlobalContext {
   int thread_num;
   int start_core;
 
   vector<thread> threads;
-  vector<PaddingInt> finished_cnt;  // thread_num 个
-  vector<vector<rte_ring *>> rings; // thread_num^2 个
 };
 GlobalContext g_ctx;
 
@@ -68,7 +61,6 @@ void GenerateWriteRequests(vector<Request> &kvs) {
   }
 }
 
-bool should_thread_run;
 void threadFunc(int idx) {
   if (g_ctx.start_core != -1) {
     cpu_set_t cpuset;
@@ -84,90 +76,43 @@ void threadFunc(int idx) {
   }
 
   std::hash<string> hasher;
-  ankerl::unordered_dense::map<string, int64_t> hash_map;
-  hash_map.reserve(kOpsPerThread * 2);
   vector<Request> req;
-  void *deque_requests[kPullNumber];
   req.reserve(kOpsPerThread);
   GenerateWriteRequests(req);
-
+  rocksdb::Status s;
   // test put
-  int request_cnt = 0;
-  int ret;
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
-  while (should_thread_run) {
-    for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
-      uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
-                                 req[request_cnt].key.length(), 0, _wyp);
-      int to_thread = key_hash % g_ctx.thread_num;
-      if (to_thread == idx) { // 就是我，不转移了
-        hash_map[req[request_cnt].key] = req[request_cnt].value;
-        g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
-                                       // 加起来等于总操作数即可结束循环
-      } else {
-        while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread][idx],
-                                       &req[request_cnt])) != 0)
-          ;
-      }
-      request_cnt++;
-    }
-    for (int i = 0; i < g_ctx.thread_num; i++) {
-      unsigned int n = rte_ring_dequeue_burst(
-          g_ctx.rings[idx][i], deque_requests, kPullNumber, nullptr);
-      for (int j = 0; j < n; j++) {
-        auto *r = static_cast<Request *>(deque_requests[j]);
-        hash_map[r->key] = r->value;
-        g_ctx.finished_cnt[idx].val++;
-      }
-    }
+  rocksdb::WriteOptions wops;
+  wops.disableWAL = true;
+  for (const auto &x : req) {
+    s = db->Put(wops, x.key, std::to_string(x.value));
   }
   pthread_barrier_wait(&barrier3);
 
-  int invalid_cnt = 0;
-  request_cnt = 0;
   // test get
   pthread_barrier_wait(&barrier1);
   // 主线程计时中
   pthread_barrier_wait(&barrier2);
-  while (should_thread_run) {
-    for (int i = 0; request_cnt < kOpsPerThread && i < kPullNumber; i++) {
-      uint64_t key_hash = wyhash(req[request_cnt].key.c_str(),
-                                 req[request_cnt].key.length(), 0, _wyp);
-      int to_thread = key_hash % g_ctx.thread_num;
-      if (to_thread == idx) { // 就是我，不转移了
-        int value = hash_map.at(req[request_cnt].key);
-        if (value == 0) {
-          invalid_cnt++;
-        }
-        g_ctx.finished_cnt[idx].val++; // 所有线程 finished_cnt
-                                       // 加起来等于总操作数即可结束循环
-      } else {
-        while ((ret = rte_ring_enqueue(g_ctx.rings[to_thread][idx],
-                                       &req[request_cnt])) != 0)
-          ;
-      }
-      request_cnt++;
-    }
-    for (int i = 0; i < g_ctx.thread_num; i++) {
-      unsigned int n = rte_ring_dequeue_burst(
-          g_ctx.rings[idx][i], deque_requests, kPullNumber, nullptr);
-      for (int j = 0; j < n; j++) {
-        auto *r = static_cast<Request *>(deque_requests[j]);
-        int value = hash_map.at(r->key);
-        if (value == 0) {
-          invalid_cnt++;
-        }
-        g_ctx.finished_cnt[idx].val++;
-      }
+  std::string v;
+  for (auto &x : req) {
+    s = db->Get(rocksdb::ReadOptions(), x.key, &v);
+    if (stoi(v) != x.value) {
+      // 因为随机生成 key 的时候可能有冲突，不报错
+      x.value = stoi(v);
     }
   }
   pthread_barrier_wait(&barrier3);
 
-  if (invalid_cnt != 0) {
-    printf("ERR %d: invalid_cnt %d", idx, invalid_cnt);
+  // test delete
+  pthread_barrier_wait(&barrier1);
+  // 主线程计时中
+  pthread_barrier_wait(&barrier2);
+  for (const auto &x : req) {
+    db->Delete(wops, x.key);
   }
+  pthread_barrier_wait(&barrier3);
 }
 
 int main(int argc, char *argv[]) {
@@ -175,19 +120,31 @@ int main(int argc, char *argv[]) {
     printf("Usage: %s <threads_num> <start_core>\n", argv[0]);
     return 0;
   }
-  printf("SPSC rte_ring test, %d write/read op per thread\n", kOpsPerThread);
+  printf("single rocksdb test, %d write/read op per thread\n", kOpsPerThread);
+
+  rocksdb::DBOptions options;
+  std::vector<rocksdb::ColumnFamilyDescriptor> loaded_cf_descs;
+  rocksdb::ConfigOptions config_options;
+  rocksdb::Status s = rocksdb::LoadOptionsFromFile(
+      config_options, "rocksdb_options.ini", &options, &loaded_cf_descs);
+  if (!s.ok()) {
+    std::cout << s.ToString() << std::endl;
+    exit(-1);
+  }
+
+  options.create_if_missing = true;
+  // loaded_cf_descs[0].options.bottommost_compression_opts =
+
+  string db_p = string("./rocks/") + "instance";
+  std::vector<rocksdb::ColumnFamilyHandle *> handles;
+  s = rocksdb::DB::Open(options, db_p, loaded_cf_descs, &handles, &db);
+  if (!s.ok()) {
+    std::cout << s.ToString() << std::endl;
+    exit(-1);
+  }
 
   g_ctx.thread_num = atoi(argv[1]);
   g_ctx.start_core = atoi(argv[2]);
-  g_ctx.finished_cnt.resize(g_ctx.thread_num);
-  g_ctx.rings = vector<vector<rte_ring *>>(
-      g_ctx.thread_num, vector<rte_ring *>(g_ctx.thread_num, nullptr));
-  for (int i = 0; i < g_ctx.thread_num; i++) {
-    for (int j = 0; j < g_ctx.thread_num; j++) {
-      g_ctx.rings[i][j] =
-          rte_ring_create(512, RING_F_SC_DEQ | RING_F_SP_ENQ);
-    }
-  }
 
   for (int i = 0; i < g_ctx.thread_num; i++) {
     g_ctx.threads.emplace_back(threadFunc, i);
@@ -207,7 +164,6 @@ int main(int argc, char *argv[]) {
   }
 
   // PUT
-  should_thread_run = true;
   pthread_barrier_init(&barrier1, nullptr, g_ctx.thread_num + 1);
   pthread_barrier_init(&barrier2, nullptr, g_ctx.thread_num + 1);
   pthread_barrier_init(&barrier3, nullptr, g_ctx.thread_num + 1);
@@ -223,25 +179,12 @@ int main(int argc, char *argv[]) {
   pthread_barrier_destroy(&barrier2);
 
   // PUT 中……
-  while (should_thread_run) {
-    int64_t sum = 0;
-    for (int i = 0; i < g_ctx.thread_num; i++) {
-      sum += g_ctx.finished_cnt[i].val;
-    }
-    if (sum == static_cast<int64_t>(kOpsPerThread) * g_ctx.thread_num) {
-      should_thread_run = false;
-    }
-  }
-  for (int i = 0; i < g_ctx.thread_num; i++) {
-    g_ctx.finished_cnt[i].val = 0;
-  }
 
   // PUT 后计时结束
   pthread_barrier_wait(&barrier3);
   pthread_barrier_destroy(&barrier3);
   int64_t used_time_in_us = GetUs() - start_ts;
 
-  should_thread_run = true;
   printf("[PUT] total %.4f Mops, in %.4f s\n"
          "      per-thread %.4f Mops\n",
          static_cast<double>(kOpsPerThread) * g_ctx.thread_num /
@@ -255,6 +198,8 @@ int main(int argc, char *argv[]) {
   // 计时前同步
   pthread_barrier_wait(&barrier1);
   pthread_barrier_destroy(&barrier1);
+  pthread_barrier_init(&barrier1, nullptr,
+                       g_ctx.thread_num + 1); // 为 DELETE 做准备
 
   // GET 前同步并开始计时
   start_ts = GetUs();
@@ -262,15 +207,6 @@ int main(int argc, char *argv[]) {
   pthread_barrier_destroy(&barrier2);
 
   // GET 中……
-  while (should_thread_run) {
-    int64_t sum = 0;
-    for (int i = 0; i < g_ctx.thread_num; i++) {
-      sum += g_ctx.finished_cnt[i].val;
-    }
-    if (sum == static_cast<int64_t>(kOpsPerThread) * g_ctx.thread_num) {
-      should_thread_run = false;
-    }
-  }
 
   // GET 后计时结束
   pthread_barrier_wait(&barrier3);
@@ -284,8 +220,38 @@ int main(int argc, char *argv[]) {
          static_cast<double>(used_time_in_us) / 1000000,
          static_cast<double>(kOpsPerThread) / used_time_in_us);
 
+  // DELETE
+  pthread_barrier_init(&barrier2, nullptr, g_ctx.thread_num + 1);
+  pthread_barrier_init(&barrier3, nullptr, g_ctx.thread_num + 1);
+  // 计时前同步
+  pthread_barrier_wait(&barrier1);
+  pthread_barrier_destroy(&barrier1);
+
+  // DELETE 前同步并开始计时
+  start_ts = GetUs();
+  pthread_barrier_wait(&barrier2);
+  pthread_barrier_destroy(&barrier2);
+
+  // DELETE 中……
+
+  // DELETE 后计时结束
+  pthread_barrier_wait(&barrier3);
+  pthread_barrier_destroy(&barrier3);
+  used_time_in_us = GetUs() - start_ts;
+
+  printf("[DELETE] total %.4f Mops, in %.4f s\n"
+         "      per-thread %.4f Mops\n",
+         static_cast<double>(kOpsPerThread) * g_ctx.thread_num /
+             used_time_in_us,
+         static_cast<double>(used_time_in_us) / 1000000,
+         static_cast<double>(kOpsPerThread) / used_time_in_us);
+
   for (int i = 0; i < g_ctx.thread_num; i++) {
     g_ctx.threads[i].join();
   }
+  for (auto *handle : handles) {
+    delete handle;
+  }
+  delete db;
   return 0;
 }
